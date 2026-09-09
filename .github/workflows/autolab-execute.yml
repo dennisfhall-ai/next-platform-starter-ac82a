@@ -1,0 +1,104 @@
+name: AutoLab Governed Executor
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Execution job id
+        required: true
+        type: string
+      run_path:
+        description: Relative path containing candidate source
+        required: true
+        type: string
+      source_digest:
+        description: Expected source bundle digest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CI: true
+    steps:
+      - name: Checkout executor repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate run path
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.run_path }}" in
+            .autolab-runs/*) ;;
+            *) echo "Unsafe run path" >&2; exit 20 ;;
+          esac
+          test -d "${{ inputs.run_path }}"
+
+      - name: Prepare disposable workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/autolab-workspace
+          mkdir -p /tmp/autolab-workspace
+          cp -a "${{ inputs.run_path }}/." /tmp/autolab-workspace/
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: /tmp/autolab-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then npm ci --ignore-scripts; else npm install --ignore-scripts; fi
+
+      - name: Typecheck
+        working-directory: /tmp/autolab-workspace
+        run: npm run typecheck --if-present
+
+      - name: Build
+        working-directory: /tmp/autolab-workspace
+        run: npm run build
+
+      - name: Lint
+        working-directory: /tmp/autolab-workspace
+        run: npm run lint --if-present
+
+      - name: Tests
+        working-directory: /tmp/autolab-workspace
+        run: npm test --if-present
+
+      - name: Emit evidence manifest
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p evidence
+          cat > evidence/result.json <<JSON
+          {
+            "run_id": "${{ inputs.run_id }}",
+            "source_digest": "${{ inputs.source_digest }}",
+            "runner": "github-hosted-ubuntu-latest",
+            "permissions": "contents-read",
+            "persist_credentials": false,
+            "production_hardened": false,
+            "workflow_conclusion": "${{ job.status }}"
+          }
+          JSON
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autolab-evidence-${{ inputs.run_id }}
+          path: evidence/result.json
+          if-no-files-found: error
+          retention-days: 7
