@@ -1,6 +1,9 @@
 name: AutoLab Governed Executor
 
 on:
+  push:
+    paths:
+      - '.autolab-runs/**/RUN_READY'
   workflow_dispatch:
     inputs:
       run_id:
@@ -31,15 +34,31 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate run path
+      - name: Resolve governed run
+        id: resolve
         shell: bash
         run: |
           set -euo pipefail
-          case "${{ inputs.run_path }}" in
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            run_id='${{ inputs.run_id }}'
+            run_path='${{ inputs.run_path }}'
+            source_digest='${{ inputs.source_digest }}'
+          else
+            marker=$(git diff-tree --no-commit-id --name-only -r "${{ github.sha }}" | grep -E '^\.autolab-runs/[^/]+/RUN_READY$' | head -n 1)
+            test -n "$marker"
+            run_path=${marker%/RUN_READY}
+            run_id=${run_path##*/}
+            source_digest=$(tr -d '\r\n' < "$marker")
+          fi
+          case "$run_path" in
             .autolab-runs/*) ;;
             *) echo "Unsafe run path" >&2; exit 20 ;;
           esac
-          test -d "${{ inputs.run_path }}"
+          test -d "$run_path"
+          test "$source_digest" != ""
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "run_path=$run_path" >> "$GITHUB_OUTPUT"
+          echo "source_digest=$source_digest" >> "$GITHUB_OUTPUT"
 
       - name: Prepare disposable workspace
         shell: bash
@@ -47,7 +66,8 @@ jobs:
           set -euo pipefail
           rm -rf /tmp/autolab-workspace
           mkdir -p /tmp/autolab-workspace
-          cp -a "${{ inputs.run_path }}/." /tmp/autolab-workspace/
+          cp -a "${{ steps.resolve.outputs.run_path }}/." /tmp/autolab-workspace/
+          rm -f /tmp/autolab-workspace/RUN_READY
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -84,12 +104,14 @@ jobs:
           mkdir -p evidence
           cat > evidence/result.json <<JSON
           {
-            "run_id": "${{ inputs.run_id }}",
-            "source_digest": "${{ inputs.source_digest }}",
+            "run_id": "${{ steps.resolve.outputs.run_id }}",
+            "source_digest": "${{ steps.resolve.outputs.source_digest }}",
             "runner": "github-hosted-ubuntu-latest",
             "permissions": "contents-read",
             "persist_credentials": false,
             "production_hardened": false,
+            "network_isolation": false,
+            "secrets_injected": false,
             "workflow_conclusion": "${{ job.status }}"
           }
           JSON
@@ -98,7 +120,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: autolab-evidence-${{ inputs.run_id }}
+          name: autolab-evidence-${{ steps.resolve.outputs.run_id }}
           path: evidence/result.json
           if-no-files-found: error
           retention-days: 7
